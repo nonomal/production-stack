@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 import aiohttp
 import requests
@@ -32,6 +32,16 @@ from vllm_router.log import init_logger
 logger = init_logger(__name__)
 
 _global_service_discovery: "Optional[ServiceDiscovery]" = None
+_MODEL_INFO_KNOWN_FIELDS = frozenset(
+    {
+        "id",
+        "object",
+        "created",
+        "owned_by",
+        "root",
+        "parent",
+    }
+)
 
 
 class ServiceDiscoveryType(enum.Enum):
@@ -51,6 +61,7 @@ class ModelInfo:
     root: Optional[str] = None
     parent: Optional[str] = None
     is_adapter: bool = False
+    extra_fields: Dict[str, Any] = None
 
     @classmethod
     def from_dict(cls, data: Dict) -> "ModelInfo":
@@ -63,51 +74,38 @@ class ModelInfo:
             root=data.get("root", None),
             parent=data.get("parent", None),
             is_adapter=data.get("parent") is not None,
+            extra_fields={
+                k: v for k, v in data.items() if k not in _MODEL_INFO_KNOWN_FIELDS
+            },
         )
 
     def to_dict(self) -> Dict:
         """Convert the ModelInfo instance to a dictionary."""
-        return {
+        data = {
             "id": self.id,
             "object": self.object,
             "created": self.created,
             "owned_by": self.owned_by,
             "root": self.root,
             "parent": self.parent,
-            "is_adapter": self.is_adapter,
         }
+        if self.extra_fields:
+            data.update(self.extra_fields)
+        return data
 
 
 @dataclass
 class EndpointInfo:
-    # Endpoint's url
     url: str
-
-    # Model names
     model_names: List[str]
-
-    # Endpoint Id
     Id: str
-
-    # Added timestamp
     added_timestamp: float
-
-    # Model label
     model_label: str
-
-    # Endpoint's sleep status
     sleep: bool
-
-    # Pod name
+    healthy: bool = True
     pod_name: Optional[str] = None
-
-    # Service name
     service_name: Optional[str] = None
-
-    # Namespace
     namespace: Optional[str] = None
-
-    # Model information including relationships
     model_info: Dict[str, ModelInfo] = None
 
     def __str__(self):
@@ -808,6 +806,20 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
 
         elif event == "MODIFIED":
             if engine_ip is None:
+                # An empty IP is ambiguous: a Pending pod has not been
+                # assigned an IP yet (skip it), but an Evicted pod has had
+                # its podIP cleared by the kubelet. In the latter case the
+                # endpoint is already registered and must be removed, or it
+                # lingers as a stale ("ghost") backend that still receives
+                # traffic until the router process restarts. Complete the
+                # symmetric removal path here.
+                if engine_name in self.available_engines:
+                    logger.warning(
+                        f"Serving engine {engine_name} has an empty IP "
+                        f"(likely evicted, podIP cleared by kubelet); "
+                        f"removing it to avoid a stale (ghost) endpoint"
+                    )
+                    self._delete_engine(engine_name)
                 return
 
             if is_pod_ready and model_names:
